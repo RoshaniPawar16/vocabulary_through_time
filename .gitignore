@@ -20,3 +20,6 @@ semantic_shift_analysis/comprehensive_results/
 semantic_shift_analysis/historical_results/
 *.pkl
 *.sh
+.DS_Store
+**/.DS_Store
+results/
