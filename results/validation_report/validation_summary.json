@@ -1,0 +1,42 @@
+{
+  "timestamp": "2025-06-25T13:33:13.214140",
+  "pipeline_summary": {
+    "total_words": 53,
+    "successful_words": 4,
+    "training_decades": 4,
+    "test_decades": 4,
+    "min_contexts_required": 100
+  },
+  "validation_summary": {
+    "mean_mse": 0.016053760272771257,
+    "mean_mae": 0.11494228685320639,
+    "mean_correlation": 0.5546333014061429,
+    "words_validated": 4,
+    "total_words": 53
+  },
+  "top_performing_words": [
+    {
+      "word": "electric",
+      "correlation": 0.8164965809277261,
+      "mse": 0.015146914532845602
+    },
+    {
+      "word": "transport",
+      "correlation": 0.8164965809277261,
+      "mse": 0.015146914532845602
+    },
+    {
+      "word": "telephone",
+      "correlation": 0.2927700218845595,
+      "mse": 0.016146811341616545
+    },
+    {
+      "word": "camera",
+      "correlation": 0.2927700218845595,
+      "mse": 0.017774400683777277
+    }
+  ],
+  "recommendations": [
+    "Increase context extraction - too few successful words"
+  ]
+}

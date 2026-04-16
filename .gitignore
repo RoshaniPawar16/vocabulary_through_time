@@ -1,0 +1,22 @@
+data/
+logs/
+maxwell_results*/
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+dist/
+.venv/
+venv/
+*.ipynb_checkpoints/
+semantic_shift_analysis copy/
+wordnet_version/
+fresh_results/
+integrated_results/
+temporal_analysis/
+cache/
+semantic_shift_analysis/results/
+semantic_shift_analysis/comprehensive_results/
+semantic_shift_analysis/historical_results/
+*.pkl
+*.sh
