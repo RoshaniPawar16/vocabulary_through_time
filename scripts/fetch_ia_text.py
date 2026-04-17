@@ -61,6 +61,17 @@ def _clean_ia_text(raw: str, max_chars: int) -> str:
     return result
 
 
+def _get_ia_files(session: requests.Session, identifier: str) -> list[dict]:
+    """Return list of file dicts from IA metadata API."""
+    try:
+        r = session.get(f"https://archive.org/metadata/{identifier}", timeout=30)
+        if r.status_code == 200:
+            return r.json().get("files", [])
+    except (requests.RequestException, ValueError):
+        pass
+    return []
+
+
 def fetch_ia_text(
     identifier: str,
     min_chars: int = 5_000,
@@ -70,8 +81,9 @@ def fetch_ia_text(
     Download plain text for an Internet Archive item.
 
     Strategy:
-      1. DjVuTXT layer  →  https://archive.org/download/{id}/{id}_djvu.txt
-      2. Plain .txt via IA files API (first English .txt file found)
+      1. DjVuTXT via metadata API (finds correct filename, e.g. inner_djvu.txt)
+      2. Fallback: {identifier}_djvu.txt (common shorthand)
+      3. Fallback: plain .txt files listed in metadata
 
     Returns cleaned text string if len >= min_chars, else None.
     """
@@ -79,40 +91,50 @@ def fetch_ia_text(
     session.headers.update({"User-Agent": "vocab-through-time-research/1.0"})
 
     raw: Optional[str] = None
+    files = _get_ia_files(session, identifier)
 
-    # --- Strategy 1: DjVuTXT ---
-    djvu_url = f"https://archive.org/download/{identifier}/{identifier}_djvu.txt"
-    try:
-        resp = session.get(djvu_url, timeout=60)
-        if resp.status_code == 200 and len(resp.text) > 1000:
-            raw = resp.text
-    except requests.RequestException:
-        pass
-
-    # --- Strategy 2: IA files metadata → plain .txt ---
-    if not raw:
-        files_url = f"https://archive.org/metadata/{identifier}/files"
+    # --- Strategy 1: DjVuTXT via metadata (correct filename) ---
+    djvu_names = [
+        f["name"] for f in files
+        if f.get("name", "").lower().endswith("_djvu.txt")
+    ]
+    for fname in djvu_names[:2]:
+        url = f"https://archive.org/download/{identifier}/{fname}"
         try:
-            meta_resp = session.get(files_url, timeout=30)
-            if meta_resp.status_code == 200:
-                files = meta_resp.json().get("result", [])
-                txt_files = [
-                    f["name"] for f in files
-                    if f.get("name", "").endswith(".txt")
-                    and "djvu" not in f.get("name", "").lower()
-                    and f.get("format", "").lower() in ("plain text", "text", "")
-                ]
-                for fname in txt_files[:3]:
-                    url = f"https://archive.org/download/{identifier}/{fname}"
-                    try:
-                        r = session.get(url, timeout=60)
-                        if r.status_code == 200 and len(r.text) > 1000:
-                            raw = r.text
-                            break
-                    except requests.RequestException:
-                        continue
-        except (requests.RequestException, ValueError):
+            resp = session.get(url, timeout=60)
+            if resp.status_code == 200 and len(resp.text) > 1000:
+                raw = resp.text
+                break
+        except requests.RequestException:
+            continue
+
+    # --- Strategy 2: DjVuTXT shorthand ---
+    if not raw:
+        url = f"https://archive.org/download/{identifier}/{identifier}_djvu.txt"
+        try:
+            resp = session.get(url, timeout=60)
+            if resp.status_code == 200 and len(resp.text) > 1000:
+                raw = resp.text
+        except requests.RequestException:
             pass
+
+    # --- Strategy 3: plain .txt files ---
+    if not raw:
+        txt_names = [
+            f["name"] for f in files
+            if f.get("name", "").endswith(".txt")
+            and "djvu" not in f.get("name", "").lower()
+            and "meta" not in f.get("name", "").lower()
+        ]
+        for fname in txt_names[:3]:
+            url = f"https://archive.org/download/{identifier}/{fname}"
+            try:
+                r = session.get(url, timeout=60)
+                if r.status_code == 200 and len(r.text) > 1000:
+                    raw = r.text
+                    break
+            except requests.RequestException:
+                continue
 
     if not raw:
         return None
@@ -128,21 +150,26 @@ def fetch_ia_text(
 # Self-test
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    TEST_ID = "GalaxyMarch1955"
+    # 'GalaxyMarch1955' is not a valid IA identifier; the real one is below.
+    TEST_ID = "galaxymagazine-1955-03"
 
     print(f"Testing fetch_ia_text('{TEST_ID}', min_chars=5000, max_chars=50000)")
     print("-" * 60)
 
-    import urllib.request
-    djvu_url = f"https://archive.org/download/{TEST_ID}/{TEST_ID}_djvu.txt"
-    print(f"DjVuTXT URL: {djvu_url}")
-
     # Show raw download size before cleaning
     try:
         import requests as _r
-        raw_resp = _r.get(djvu_url, timeout=60)
-        raw_size = len(raw_resp.content)
-        print(f"Raw download size: {raw_size:,} bytes  (HTTP {raw_resp.status_code})")
+        files_meta = _r.get(f"https://archive.org/metadata/{TEST_ID}", timeout=30).json().get("files", [])
+        djvu_name = next((f["name"] for f in files_meta if f.get("name","").endswith("_djvu.txt")), None)
+        if djvu_name:
+            djvu_url = f"https://archive.org/download/{TEST_ID}/{djvu_name}"
+            print(f"DjVuTXT URL: {djvu_url}")
+            raw_resp = _r.get(djvu_url, timeout=60)
+            raw_size = len(raw_resp.content)
+            print(f"Raw download size: {raw_size:,} bytes  (HTTP {raw_resp.status_code})")
+        else:
+            print("No _djvu.txt file found in metadata")
+            raw_size = 0
     except Exception as e:
         print(f"Raw size check failed: {e}")
         raw_size = 0
