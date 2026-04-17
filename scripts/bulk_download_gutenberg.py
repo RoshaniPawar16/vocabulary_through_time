@@ -22,11 +22,11 @@ MAX_BOOKS_PER_AUTHOR_PER_DECADE = 3
 GUTENBERG_CSV_URL = "https://www.gutenberg.org/cache/epub/feeds/pg_catalog.csv.gz"
 
 PROJECT_ROOT = Path(__file__).parent.parent
-TARGET_DIR = PROJECT_ROOT / "data" / "processed"
+TARGET_DIR = PROJECT_ROOT / "data" / "real_historical_texts" / "gutenberg"
 
 def clean_gutenberg_text(text: str) -> str:
-    start_pattern = r"\\*\\*\\* START OF (THIS|THE) PROJECT GUTENBERG EBOOK .* \\*\\*\\*"
-    end_pattern = r"\\*\\*\\* END OF (THIS|THE) PROJECT GUTENBERG EBOOK .* \\*\\*\\*"
+    start_pattern = r"\*\*\* START OF (THIS|THE) PROJECT GUTENBERG EBOOK .* \*\*\*"
+    end_pattern = r"\*\*\* END OF (THIS|THE) PROJECT GUTENBERG EBOOK .* \*\*\*"
     
     start_match = re.search(start_pattern, text, re.IGNORECASE)
     end_match = re.search(end_pattern, text, re.IGNORECASE)
@@ -42,7 +42,7 @@ def find_publication_year(text_header: str) -> int | None:
     """Heuristically find the original publication year from the text header."""
     # Look for a 4-digit number in the target range.
     # This is not perfect but the best we can do without reliable metadata.
-    potential_years = re.findall(r'\b(18[5-9]\d|19[0-2]\d)\b', text_header)
+    potential_years = re.findall(r'\b(18[5-9]\d|19[0-3]\d)\b', text_header)
     if potential_years:
         # Often the first year mentioned is the original publication.
         return int(potential_years[0])
@@ -113,16 +113,19 @@ def download_and_process_book(book: dict, books_by_decade: defaultdict, author_c
         if cleaned_text and len(cleaned_text) > 1000:
             decade_path = TARGET_DIR / book_decade
             decade_path.mkdir(exist_ok=True)
-            
+
             title = book.get('Title', f'unknown_title_{book_id}').replace(' ', '_').lower()
             clean_title = re.sub(r'[^a-z0-9_]', '', title)[:50]
             filename = f"{book_id}_{clean_title}.txt"
-            
-            if any(f.name.startswith(f"{book_id}_") for f in decade_path.iterdir()):
-                logger.info(f"  -> Already exists. Skipping.")
-                return False
 
+            # CHANGE 3: never overwrite — check by book_id prefix first, then exact filename
+            if any(f.name.startswith(f"{book_id}_") for f in decade_path.iterdir()):
+                logger.info(f"  -> ALREADY_EXISTS {book_id} in {book_decade}. Skipping.")
+                return False
             target_file = decade_path / filename
+            if target_file.exists():
+                logger.info(f"  -> ALREADY_EXISTS {filename}. Skipping.")
+                return False
             with open(target_file, "w", encoding="utf-8") as f:
                 f.write(cleaned_text)
             
