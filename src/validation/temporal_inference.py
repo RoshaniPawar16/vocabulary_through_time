@@ -1717,11 +1717,14 @@ class TemporalDistributionInference:
                     # Ensure text is not too long for tokenizer
                     if isinstance(text, tuple):
                         text = text[0]  # Extract text if it's a (text, source) tuple
-                        
+
+                    # Cap text length — full Gutenberg novels (400K+ chars) cause 10s+ tokenization
+                    text = text[:50_000]
+
                     # Skip very short chunks
                     if len(text) < 100:
                         continue
-                        
+
                     # Tokenize chunk with error handling
                     try:
                         tokens = self.tokenizer.tokenize(text)
@@ -4269,13 +4272,15 @@ class TemporalDistributionInference:
         plt.savefig(self.results_dir / f"{self.tokenizer_name}_temporal_distribution.png")
         plt.close()
 
-    def run_analysis(self, decade_texts: Dict[str, List[str]]) -> Dict:
+    def run_analysis(self, decade_texts: Dict[str, List[str]], use_semantic_shift: bool = False) -> Dict:
         """
         Run complete analysis pipeline with enhanced methods.
-        
+
         Args:
             decade_texts: Dictionary mapping decades to lists of texts
-            
+            use_semantic_shift: Whether to run semantic shift analysis (default False —
+                requires >=50 contexts per shift word to produce classifiers)
+
         Returns:
             Complete analysis results
         """
@@ -4300,6 +4305,9 @@ class TemporalDistributionInference:
             logger.warning(f"Total data volume: {quality_metrics['overall']['total_data_gb']:.2f} GB")
             logger.warning("Consider increasing data volume or text quality before proceeding")
         
+        # Override semantic shift flag before analyze_decade_patterns checks it
+        self.use_semantic_shift = use_semantic_shift
+
         # Continue with the existing analysis steps...
         # Step 1: Analyze decade patterns with increased sample size
         logger.info("Analyzing decade patterns...")
@@ -4321,7 +4329,8 @@ class TemporalDistributionInference:
         logger.info("Inferring temporal distribution...")
         distribution = self.infer_temporal_distribution(
             decade_patterns,
-            weight_early_merges=True
+            weight_early_merges=True,
+            use_semantic_shift=use_semantic_shift,
         )
         
         # Step 4: Visualize results
@@ -4339,59 +4348,73 @@ class TemporalDistributionInference:
         """
         Infer the temporal distribution for a single input text string.
 
-        Compares the text's tokenizer merge-rule usage frequency vector against
-        the per-decade baseline vectors cached by the most recent run_analysis()
-        call, using cosine similarity normalised to a probability distribution.
+        Uses IDF-weighted WordPiece token cosine similarity against per-decade
+        baselines cached by run_analysis(). Tokens common to all decades (e.g.
+        "the", "and") receive near-zero IDF weight; tokens distinctive to specific
+        decades (era-specific vocabulary and its subword decomposition) dominate.
 
         Args:
-            text: The input text to analyse. Truncated to 10 000 chars to
-                  avoid tokeniser OOM on very large inputs.
+            text: Input text. Truncated to 10 000 chars internally.
         Returns:
             Dict mapping decade string -> probability float, summing to 1.0.
         Raises:
             RuntimeError: If run_analysis() has not been called first.
         """
+        import math
+        from collections import Counter
+
         if self._decade_patterns is None:
             raise RuntimeError(
                 "run_inference_on_text() requires stored decade baselines. "
                 "Call run_analysis() before calling this method."
             )
 
+        n_decades = len(self._decade_patterns)
+        uniform = {d: 1.0 / n_decades for d in self._decade_patterns}
+
+        # IDF: log(N / (1 + number_of_decades_where_token_appears))
+        token_decade_count: Dict[str, int] = {}
+        for patterns in self._decade_patterns.values():
+            for tok in patterns.get("tokens", {}):
+                token_decade_count[tok] = token_decade_count.get(tok, 0) + 1
+        idf: Dict[str, float] = {
+            tok: math.log(n_decades / (1.0 + cnt))
+            for tok, cnt in token_decade_count.items()
+        }
+
+        # Tokenize input text
         try:
             tokens = self.tokenizer.tokenize(text[:10_000])
         except Exception as e:
             logger.error(f"Tokenisation failed in run_inference_on_text: {e}")
             raise
 
-        n_decades = len(self._decade_patterns)
-        if not tokens or n_decades == 0:
-            return {d: 1.0 / max(n_decades, 1) for d in self._decade_patterns}
+        if not tokens:
+            return uniform
 
-        # Build merge-rule frequency vector for this text
-        text_counts: Dict[str, int] = {}
-        for token in tokens:
-            for rule in self._extract_merge_rules(token):
-                text_counts[rule] = text_counts.get(rule, 0) + 1
-        text_total = max(sum(text_counts.values()), 1)
+        tf_text = Counter(tokens)
+        total_text = max(sum(tf_text.values()), 1)
 
-        # Cosine similarity between text vector and each decade baseline vector
+        # IDF-weighted cosine similarity: text vs each decade baseline
         similarities: Dict[str, float] = {}
         for decade, patterns in self._decade_patterns.items():
-            decade_rules = patterns.get("merge_rules", {})
-            if not decade_rules:
+            decade_tokens = patterns.get("tokens", {})
+            if not decade_tokens:
                 similarities[decade] = 0.0
                 continue
-            decade_total = max(sum(decade_rules.values()), 1)
+            decade_total = max(sum(decade_tokens.values()), 1)
             dot = sum(
-                (text_counts.get(rule, 0) / text_total)
-                * (count / decade_total)
-                for rule, count in decade_rules.items()
+                (tf_text.get(tok, 0) / total_text)
+                * (cnt / decade_total)
+                * max(0.0, idf.get(tok, 0.0))
+                for tok, cnt in decade_tokens.items()
+                if tok in tf_text  # only tokens present in test text
             )
             similarities[decade] = max(0.0, dot)
 
         total = sum(similarities.values())
         if total == 0.0:
-            return {d: 1.0 / n_decades for d in self._decade_patterns}
+            return uniform
         return {d: s / total for d, s in similarities.items()}
 
     def batch_process_semantic_shifts(self, decade_texts, word_list=None, batch_size=100):

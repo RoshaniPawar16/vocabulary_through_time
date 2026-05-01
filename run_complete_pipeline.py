@@ -322,7 +322,10 @@ def run_research_pipeline(config: dict) -> dict:
             _safe_ensemble, analyzer
         )
 
-        analysis = analyzer.run_analysis(corpus)
+        analysis = analyzer.run_analysis(
+            corpus,
+            use_semantic_shift=config.get('use_semantic_shift', False),
+        )
 
         eval_results = None
         if do_eval:
