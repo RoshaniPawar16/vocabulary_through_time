@@ -78,6 +78,7 @@ class TemporalDistributionInference:
             self.shift_words = self._initialize_shift_words()  # Known semantic shift words
             self.sense_classifiers = {}  # Will store trained classifiers
             self.default_alpha = 0.2  # Default weight for semantic signal
+            self._decade_patterns: Optional[Dict] = None  # cached by run_analysis()
 
             # Method 1: GPT-2 style tokenizers often have bpe_ranks
             if hasattr(self.tokenizer, 'bpe_ranks'):
@@ -3325,23 +3326,29 @@ class TemporalDistributionInference:
         modern_decades = ["1990s", "2000s", "2010s", "2020s"]
         
         # Variables - alpha represents the decade proportions
-        alpha = cp.Variable(len(decades), pos=True)
+        # Note: pos=True removed — Clarabel's log-barrier conflicts with explicit min_bound constraints
+        alpha = cp.Variable(len(decades))
         
         # Enhanced constraint formulation that prevents numerical issues
         constraints = [cp.sum(alpha) == 1]
         
         # Improved bounds with better numerical conditioning
         min_bound = 0.008  # Slightly higher than your original 0.005 for stability
+        # Compute per-decade upper bounds, then scale so their sum >= 1.0 (feasibility guard)
+        raw_ubs = []
+        for decade in decades:
+            if decade in historical_decades:
+                raw_ubs.append(0.25)
+            elif decade in ["1930s", "1960s"]:
+                raw_ubs.append(0.12)
+            else:
+                raw_ubs.append(0.20)
+        ub_sum = sum(raw_ubs)
+        scale = max(1.0, 1.0 / ub_sum) if ub_sum > 0 else 1.0
+        upper_bounds = [min(1.0, ub * scale) for ub in raw_ubs]
         for i, decade in enumerate(decades):
             constraints.append(alpha[i] >= min_bound)
-            
-            # Decade-specific upper bounds to prevent unrealistic concentrations
-            if decade in historical_decades:
-                constraints.append(alpha[i] <= 0.25)  # Allow reasonable historical representation
-            elif decade in ["1930s", "1960s"]:
-                constraints.append(alpha[i] <= 0.12)  # These decades often get overrepresented
-            else:
-                constraints.append(alpha[i] <= 0.20)
+            constraints.append(alpha[i] <= upper_bounds[i])
         
         # Enhanced frequency extraction with proper error handling
         try:
@@ -3350,11 +3357,11 @@ class TemporalDistributionInference:
             )
         except Exception as e:
             logger.error(f"Error in frequency extraction: {e}")
-            return self._heuristic_fallback(decades)
-        
+            return self._enhanced_heuristic_fallback(decades)
+
         if not merge_frequencies:
             logger.warning("No valid merge frequencies found, using heuristic approach")
-            return self._heuristic_fallback(decades)
+            return self._enhanced_heuristic_fallback(decades)
         
         # Build objective function with improved numerical stability
         objective_terms = []
@@ -3436,6 +3443,10 @@ class TemporalDistributionInference:
         # Solver configurations optimized for your specific problem characteristics
         solver_configs = [
             {
+                'name': 'CLARABEL',
+                'params': {}
+            },
+            {
                 'name': 'ECOS',
                 'params': {
                     'max_iters': 1000,
@@ -3446,7 +3457,7 @@ class TemporalDistributionInference:
                 }
             },
             {
-                'name': 'OSQP', 
+                'name': 'OSQP',
                 'params': {
                     'max_iter': 4000,
                     'eps_abs': 1e-6,
@@ -4293,7 +4304,8 @@ class TemporalDistributionInference:
         # Step 1: Analyze decade patterns with increased sample size
         logger.info("Analyzing decade patterns...")
         decade_patterns = self.analyze_decade_patterns(decade_texts, sample_size=10000)
-        
+        self._decade_patterns = decade_patterns  # cache for run_inference_on_text()
+
         # Step 2: Find distinctive patterns
         logger.info("Finding distinctive patterns...")
         distinctive_patterns = self.find_distinctive_patterns(decade_patterns)
@@ -4322,6 +4334,65 @@ class TemporalDistributionInference:
             "distinctive_patterns": distinctive_patterns,
             "distribution": distribution
         }
+
+    def run_inference_on_text(self, text: str) -> Dict[str, float]:
+        """
+        Infer the temporal distribution for a single input text string.
+
+        Compares the text's tokenizer merge-rule usage frequency vector against
+        the per-decade baseline vectors cached by the most recent run_analysis()
+        call, using cosine similarity normalised to a probability distribution.
+
+        Args:
+            text: The input text to analyse. Truncated to 10 000 chars to
+                  avoid tokeniser OOM on very large inputs.
+        Returns:
+            Dict mapping decade string -> probability float, summing to 1.0.
+        Raises:
+            RuntimeError: If run_analysis() has not been called first.
+        """
+        if self._decade_patterns is None:
+            raise RuntimeError(
+                "run_inference_on_text() requires stored decade baselines. "
+                "Call run_analysis() before calling this method."
+            )
+
+        try:
+            tokens = self.tokenizer.tokenize(text[:10_000])
+        except Exception as e:
+            logger.error(f"Tokenisation failed in run_inference_on_text: {e}")
+            raise
+
+        n_decades = len(self._decade_patterns)
+        if not tokens or n_decades == 0:
+            return {d: 1.0 / max(n_decades, 1) for d in self._decade_patterns}
+
+        # Build merge-rule frequency vector for this text
+        text_counts: Dict[str, int] = {}
+        for token in tokens:
+            for rule in self._extract_merge_rules(token):
+                text_counts[rule] = text_counts.get(rule, 0) + 1
+        text_total = max(sum(text_counts.values()), 1)
+
+        # Cosine similarity between text vector and each decade baseline vector
+        similarities: Dict[str, float] = {}
+        for decade, patterns in self._decade_patterns.items():
+            decade_rules = patterns.get("merge_rules", {})
+            if not decade_rules:
+                similarities[decade] = 0.0
+                continue
+            decade_total = max(sum(decade_rules.values()), 1)
+            dot = sum(
+                (text_counts.get(rule, 0) / text_total)
+                * (count / decade_total)
+                for rule, count in decade_rules.items()
+            )
+            similarities[decade] = max(0.0, dot)
+
+        total = sum(similarities.values())
+        if total == 0.0:
+            return {d: 1.0 / n_decades for d in self._decade_patterns}
+        return {d: s / total for d, s in similarities.items()}
 
     def batch_process_semantic_shifts(self, decade_texts, word_list=None, batch_size=100):
         """

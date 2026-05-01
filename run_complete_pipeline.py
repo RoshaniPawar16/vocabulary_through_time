@@ -8,6 +8,10 @@ import sys
 import os
 import subprocess
 from pathlib import Path
+import json
+from typing import Dict, List, Optional
+from src.validation.temporal_inference import TemporalDistributionInference
+from src.evaluation import run_evaluation
 
 def check_requirements():
     """Check if all required dependencies are available"""
@@ -177,6 +181,166 @@ def run_pipeline(mode):
                 
         except Exception as e:
             print(f"\n❌ Error running complete pipeline: {e}")
+
+
+def load_corpus(
+    data_dir: str,
+    decades: Optional[List[str]] = None,
+    max_per_decade: int = 20,
+) -> Dict[str, List[str]]:
+    """
+    Load corpus texts from data_dir for each requested decade.
+
+    Handles four storage formats in priority order:
+      1. data_dir/gutenberg/{decade}/*.txt
+      2. data_dir/ia/{decade}/*.txt
+      3. data_dir/{decade}_wikipedia.json  (JSON list of strings)
+      4. data_dir/wikipedia_{decade}.json  (JSON dict with 'articles' array)
+
+    Returns a dict mapping decade -> list of text strings (capped at max_per_decade).
+    """
+    base = Path(data_dir)
+    ALL_DECADES = [
+        "1850s", "1860s", "1870s", "1880s", "1890s",
+        "1900s", "1910s", "1920s", "1930s", "1940s",
+        "1950s", "1960s", "1970s", "1980s",
+        "1990s", "2000s", "2010s", "2020s",
+    ]
+    target = decades if decades else ALL_DECADES
+
+    corpus: Dict[str, List[str]] = {}
+    for decade in target:
+        texts: List[str] = []
+
+        # Format 1: gutenberg .txt directory
+        gutenberg_dir = base / "gutenberg" / decade
+        if gutenberg_dir.exists():
+            for p in sorted(gutenberg_dir.glob("*.txt"))[:max_per_decade]:
+                texts.append(p.read_text(encoding="utf-8", errors="ignore"))
+
+        # Format 2: internet-archive .txt directory.
+        # IA data lives under the project root (vocabulary_through_time/data/),
+        # not under the same base as gutenberg and Wikipedia, so we probe both.
+        if not texts:
+            ia_candidates = [
+                base / "ia" / decade,
+                Path(__file__).parent / "data" / "real_historical_texts" / "ia" / decade,
+            ]
+            for ia_dir in ia_candidates:
+                if ia_dir.exists():
+                    for p in sorted(ia_dir.glob("*.txt"))[:max_per_decade]:
+                        texts.append(p.read_text(encoding="utf-8", errors="ignore"))
+                    if texts:
+                        break
+
+        # Format 3: {decade}_wikipedia.json -- JSON list of strings
+        if not texts:
+            j = base / f"{decade}_wikipedia.json"
+            if j.exists():
+                data = json.loads(j.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    texts = [s for s in data if isinstance(s, str)][:max_per_decade]
+
+        # Format 4: wikipedia_{decade}.json -- JSON dict with 'articles' array
+        if not texts:
+            j = base / f"wikipedia_{decade}.json"
+            if j.exists():
+                data = json.loads(j.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and "articles" in data:
+                    texts = [
+                        a["text"] for a in data["articles"]
+                        if isinstance(a, dict) and "text" in a
+                    ][:max_per_decade]
+
+        corpus[decade] = texts
+        status = f"{len(texts)} texts" if texts else "NO SOURCE FOUND"
+        print(f"  load_corpus: {decade} -> {status}")
+
+    return corpus
+
+
+def run_research_pipeline(config: dict) -> dict:
+    """
+    Execute the temporal inference pipeline on real historical corpus data.
+
+    Args:
+        config: Dict with keys:
+            tokenizers           -- list of HuggingFace tokenizer names
+            data_dir             -- path to real_historical_texts root
+            output_dir           -- where to write per-tokenizer JSON results
+            decades              -- list of decade strings, or None for all available
+            use_semantic_shift   -- passed through to TemporalDistributionInference
+            run_evaluation       -- whether to call run_evaluation() after inference
+            max_texts_per_decade -- cap passed to load_corpus()
+    Returns:
+        Dict keyed by tokenizer name; each value has 'distribution' and
+        optionally 'evaluation' sub-dicts.
+    """
+    CORPUS_ROOT = Path(__file__).parent.parent / "data" / "real_historical_texts"
+    data_dir   = config.get("data_dir") or str(CORPUS_ROOT)
+    if not Path(data_dir).is_absolute():
+        data_dir = str(CORPUS_ROOT)
+    output_dir = config["output_dir"]
+    tokenizers = config["tokenizers"]
+    decades    = config.get("decades", None)
+    do_eval    = config.get("run_evaluation", True)
+    max_texts  = config.get("max_texts_per_decade", 20)
+
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    corpus = load_corpus(data_dir, decades, max_per_decade=max_texts)
+    if not any(corpus.values()):
+        raise RuntimeError(
+            f"No texts loaded from '{data_dir}'. "
+            "Check that data_dir points to real_historical_texts and "
+            "that the requested decades exist there."
+        )
+
+    results = {}
+    for tok_name in tokenizers:
+        print(f"\n--- Running: {tok_name} ---")
+        analyzer = TemporalDistributionInference(tok_name)
+
+        # Break the pre-existing mutual recursion between infer_temporal_distribution
+        # and infer_distribution_ensemble: the default ensemble methods all call
+        # infer_temporal_distribution, which on LP failure calls infer_distribution_ensemble
+        # again -- infinite loop.  We replace the ensemble on this instance with a
+        # heuristic-only path that has no LP call, so the cycle cannot form.
+        import types as _types
+
+        def _safe_ensemble(self_a, decade_patterns, methods=None, weights=None):
+            """Heuristic-only ensemble fallback -- avoids re-entering the LP path."""
+            try:
+                filtered = self_a.remove_top_frequent_tokens(decade_patterns, 10)
+                return self_a._infer_distribution_heuristic(filtered)
+            except Exception as _e:
+                logger.warning(f"Heuristic fallback also failed: {_e}; returning uniform")
+                decades_k = list(decade_patterns.keys())
+                return {d: 1.0 / len(decades_k) for d in decades_k}
+
+        analyzer.infer_distribution_ensemble = _types.MethodType(
+            _safe_ensemble, analyzer
+        )
+
+        analysis = analyzer.run_analysis(corpus)
+
+        eval_results = None
+        if do_eval:
+            eval_results = run_evaluation(analyzer, corpus)
+
+        results[tok_name] = {
+            "distribution": analysis.get("distribution", {}),
+            "evaluation":   eval_results,
+        }
+
+        safe_name = tok_name.replace("/", "_")
+        out_path = Path(output_dir) / f"{safe_name}.json"
+        with open(out_path, "w") as f:
+            json.dump(results[tok_name], f, indent=2, default=str)
+        print(f"    Saved -> {out_path}")
+
+    return results
+
 
 def main():
     """Main execution function"""
