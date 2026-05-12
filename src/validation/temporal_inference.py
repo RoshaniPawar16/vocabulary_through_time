@@ -26,7 +26,15 @@ from collections import defaultdict
 from sklearn.cluster import KMeans
 from sklearn.linear_model import LogisticRegression
 from sentence_transformers import SentenceTransformer
+import torch as _torch
 import nltk
+
+def _best_device() -> str:
+    if _torch.backends.mps.is_available():
+        return "mps"
+    if _torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
 from nltk.tokenize import word_tokenize, sent_tokenize
 nltk.download('punkt', quiet=True)
 
@@ -829,7 +837,7 @@ class TemporalDistributionInference:
         
         return results
 
-    def train_sense_classifiers(self, decade_texts, embedding_batch_size=32):
+    def train_sense_classifiers(self, decade_texts, embedding_batch_size=32, min_contexts=50):
         """
         Enhanced sense classifier training that ensures higher quality results.
         This maintains your existing method signature while improving reliability.
@@ -839,7 +847,7 @@ class TemporalDistributionInference:
         # Load sentence transformer model if not already loaded
         if self.semantic_model is None:
             try:
-                self.semantic_model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
+                self.semantic_model = SentenceTransformer('paraphrase-MiniLM-L6-v2', device=_best_device())
                 logger.info("Loaded sentence transformer model for context embeddings")
             except Exception as e:
                 logger.error(f"Failed to load semantic model: {e}")
@@ -847,7 +855,7 @@ class TemporalDistributionInference:
                 return {}
         
         reliable_classifiers = {}
-        min_contexts = 50  # Increased minimum for better reliability
+        # min_contexts is now a parameter (default 50); lower values are tested in targeted experiments
         min_cv_score = 0.6  # Minimum cross-validation score
         
         # Process each word with quality controls
@@ -1134,7 +1142,7 @@ class TemporalDistributionInference:
         logger.info(f"Computed sense distributions for {len(test_decade_texts)} decades in test data")
         return test_sense_distributions
 
-    def calculate_semantic_temporal_signal(self, decade_texts, use_test_mode=False):
+    def calculate_semantic_temporal_signal(self, decade_texts, use_test_mode=False, min_contexts=50):
         """
         Calculate improved temporal distribution signal based on semantic shifts.
         
@@ -1156,10 +1164,13 @@ class TemporalDistributionInference:
         # Train or apply sense classifiers
         if use_test_mode and hasattr(self, 'sense_classifiers') and self.sense_classifiers:
             logger.info("Using existing classifiers in test mode")
-            sense_distributions = self.apply_sense_classifiers_to_test(decade_texts)
+            # decade_texts may be processed patterns; extract text_sample if present
+            raw_for_apply = {d: (v['text_sample'] if isinstance(v, dict) and 'text_sample' in v else v)
+                             for d, v in decade_texts.items()}
+            sense_distributions = self.apply_sense_classifiers_to_test(raw_for_apply)
         else:
             # Train classifiers
-            self.sense_classifiers = self.train_sense_classifiers(word_contexts)
+            self.sense_classifiers = self.train_sense_classifiers(decade_texts, min_contexts=min_contexts)
             
             # If classifiers were trained, apply them to calculate distributions
             if self.sense_classifiers:
@@ -1217,6 +1228,16 @@ class TemporalDistributionInference:
                     # Fall back to theoretical curve
                     decade_signals[decade] = (decade_start - 1850) / (2020 - 1850)
         
+        # If no decade has real classifier data, refuse to use the theoretical fallback
+        # (would produce a spurious linear ramp unrelated to any tokenizer's vocabulary)
+        has_real_data = any(
+            d in sense_distributions and '__aggregate__' in sense_distributions[d]
+            for d in decades
+        )
+        if not has_real_data:
+            logger.warning("No real sense-classifier data available; returning empty semantic distribution")
+            return {}
+
         # Normalize signal values to create a proper distribution
         min_signal = min(decade_signals.values())
         max_signal = max(decade_signals.values())
@@ -1664,7 +1685,7 @@ class TemporalDistributionInference:
         
         return uncertainty
 
-    def analyze_decade_patterns(self, decade_texts: Dict[str, List[str]], sample_size: int = 5000) -> Dict[str, Dict]:
+    def analyze_decade_patterns(self, decade_texts: Dict[str, List[str]], sample_size: int = 5000, min_contexts: int = 50) -> Dict[str, Dict]:
         """
         Analyze merge rules and token patterns for each decade with improved memory efficiency.
         Also prepares data for semantic shift analysis when enabled.
@@ -1781,9 +1802,12 @@ class TemporalDistributionInference:
         if hasattr(self, 'use_semantic_shift') and self.use_semantic_shift:
             try:
                 logger.info("Preparing semantic shift analysis data...")
-                # Train sense classifiers using the text samples
-                self.sense_classifiers = self.train_sense_classifiers(decade_texts)
-                logger.info(f"Successfully trained {len(self.sense_classifiers)} sense classifiers")
+                # Skip retraining if classifiers were pre-injected (shared across tokenizers)
+                if hasattr(self, 'sense_classifiers') and self.sense_classifiers:
+                    logger.info(f"Using {len(self.sense_classifiers)} pre-trained sense classifiers")
+                else:
+                    self.sense_classifiers = self.train_sense_classifiers(decade_texts, min_contexts=min_contexts)
+                    logger.info(f"Successfully trained {len(self.sense_classifiers)} sense classifiers")
             except Exception as e:
                 logger.error(f"Error preparing semantic shift analysis: {e}")
                 # Continue without semantic shift analysis
@@ -2534,7 +2558,7 @@ class TemporalDistributionInference:
                     logger.info("Applying semantic shift analysis to enhance distribution...")
                     
                     # Calculate semantic temporal signal
-                    semantic_distribution = self.calculate_semantic_temporal_signal(decade_patterns)
+                    semantic_distribution = self.calculate_semantic_temporal_signal(decade_patterns, use_test_mode=True)
                     
                     if semantic_distribution:
                         # Store the original BPE/LP distribution for reference
@@ -2572,7 +2596,7 @@ class TemporalDistributionInference:
                     logger.info("Applying semantic shift analysis to ensemble distribution...")
                     
                     # Calculate semantic temporal signal
-                    semantic_distribution = self.calculate_semantic_temporal_signal(decade_patterns)
+                    semantic_distribution = self.calculate_semantic_temporal_signal(decade_patterns, use_test_mode=True)
                     
                     if semantic_distribution:
                         # Determine optimal alpha (weighting factor)
@@ -4272,7 +4296,7 @@ class TemporalDistributionInference:
         plt.savefig(self.results_dir / f"{self.tokenizer_name}_temporal_distribution.png")
         plt.close()
 
-    def run_analysis(self, decade_texts: Dict[str, List[str]], use_semantic_shift: bool = False) -> Dict:
+    def run_analysis(self, decade_texts: Dict[str, List[str]], use_semantic_shift: bool = False, min_contexts: int = 50) -> Dict:
         """
         Run complete analysis pipeline with enhanced methods.
 
@@ -4311,7 +4335,7 @@ class TemporalDistributionInference:
         # Continue with the existing analysis steps...
         # Step 1: Analyze decade patterns with increased sample size
         logger.info("Analyzing decade patterns...")
-        decade_patterns = self.analyze_decade_patterns(decade_texts, sample_size=10000)
+        decade_patterns = self.analyze_decade_patterns(decade_texts, sample_size=10000, min_contexts=min_contexts)
         self._decade_patterns = decade_patterns  # cache for run_inference_on_text()
 
         # Step 2: Find distinctive patterns
@@ -4439,7 +4463,7 @@ class TemporalDistributionInference:
         if self.semantic_model is None:
             try:
                 from sentence_transformers import SentenceTransformer
-                self.semantic_model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
+                self.semantic_model = SentenceTransformer('paraphrase-MiniLM-L6-v2', device=_best_device())
                 logger.info("Loaded sentence transformer model for batch processing")
             except Exception as e:
                 logger.error(f"Failed to load semantic model: {e}")
@@ -4963,7 +4987,7 @@ class TemporalDistributionInference:
         if self.semantic_model is None:
             try:
                 from sentence_transformers import SentenceTransformer
-                self.semantic_model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
+                self.semantic_model = SentenceTransformer('paraphrase-MiniLM-L6-v2', device=_best_device())
             except Exception as e:
                 logger.error(f"Failed to load semantic model: {e}")
                 return None
