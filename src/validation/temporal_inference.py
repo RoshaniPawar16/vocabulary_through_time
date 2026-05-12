@@ -627,11 +627,14 @@ class TemporalDistributionInference:
             # Extract text content if tuple
             if isinstance(text, tuple):
                 text = text[0]
-                
+
             # Ensure text is a string - Add type validation
             if not isinstance(text, str):
                 logger.debug(f"Skipping non-string text of type: {type(text)}")
                 continue
+
+            # Truncate to first 5k chars to avoid processing entire Gutenberg novels
+            text = text[:5000]
                 
             # Skip very short or empty texts
             if not text or len(text.strip()) < 10:
