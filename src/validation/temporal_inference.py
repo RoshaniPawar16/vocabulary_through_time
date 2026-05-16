@@ -1504,7 +1504,8 @@ class TemporalDistributionInference:
         total = sum(combined_distribution.values())
         if total > 0:
             combined_distribution = {decade: value / total for decade, value in combined_distribution.items()}
-        
+
+        print(f"[combine_distributions] alpha={alpha:.4f} tokenizer={getattr(self, 'tokenizer_name', '?')}")
         return combined_distribution
 
     def _assess_semantic_signal_quality(self, semantic_distribution):

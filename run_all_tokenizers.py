@@ -29,8 +29,8 @@ TOKENIZERS = [
 ]
 
 DATA_DIR   = "/Users/roshani/Downloads/MSc_AI_Project/data/real_historical_texts"
-OUTPUT_DIR = Path("results/semantic_shift_run")
-MAX_TEXTS  = 5
+OUTPUT_DIR = Path("results/gold_standard_comparison")
+MAX_TEXTS  = 20
 TIMEOUT_S  = 90 * 60  # 90 minutes total wall clock
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
