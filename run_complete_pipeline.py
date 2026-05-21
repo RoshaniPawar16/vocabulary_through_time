@@ -252,6 +252,17 @@ def load_corpus(
                         if isinstance(a, dict) and "text" in a
                     ][:max_per_decade]
 
+        # Format 5: wikipedia_{decade}_full.json -- full articles dict with 'articles' array
+        if not texts:
+            j = base / f"wikipedia_{decade}_full.json"
+            if j.exists():
+                data = json.loads(j.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and "articles" in data:
+                    texts = [
+                        a["text"] for a in data["articles"]
+                        if isinstance(a, dict) and "text" in a
+                    ][:max_per_decade]
+
         corpus[decade] = texts
         status = f"{len(texts)} texts" if texts else "NO SOURCE FOUND"
         print(f"  load_corpus: {decade} -> {status}")
